@@ -1,4 +1,4 @@
-# Waitlist CLI
+# Waitlist
 
 Small Go binary that serves a waitlist form and SQLite-backed API.
 
