@@ -4,9 +4,9 @@ Small Go binary that serves a waitlist form and SQLite-backed API.
 
 ## Commands
 
-- `waitlist serve [-f path]` creates/opens the DB (`DATABASE_PATH` or `waitlist.db`) and listens on `:PORT` (`:8080` default) while serving `index.html`.
+- `waitlist serve [-f path]` creates/opens the DB (`DATABASE_PATH` or `waitlist.db`) and listens on `:PORT` (`:8080` default)
 - `waitlist list [-f path] [--honeypot]` tab-prints rows from `waitlist` or `waitlist_honeypot`.
-- `waitlist demo [-dir path]` seeds a temp SQLite file in `dir` then runs `serve` against it.
+- `waitlist demo [-dir path]` serves the demo `index.html` and stores the waitlist in a uniquely named database file
 
 ## API
 

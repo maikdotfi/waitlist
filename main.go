@@ -116,7 +116,6 @@ func runAPIServer(dbPathOverride string) error {
 	srv := &server{db: db}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", serveIndex)
 	mux.HandleFunc("/api/v1/waitlist", srv.waitlistHandler)
 
 	addr := serverAddr()
