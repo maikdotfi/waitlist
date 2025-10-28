@@ -5,13 +5,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"net/http"
 	"net/mail"
 	"os"
+	"path/filepath"
 	"strings"
+	"text/tabwriter"
 
 	_ "modernc.org/sqlite"
 )
@@ -27,31 +31,58 @@ type server struct {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS waitlist (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	email TEXT NOT NULL UNIQUE,
-	created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );`
 
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "demo":
-			if err := runDemo(); err != nil {
-				log.Fatalf("demo failed: %v", err)
-			}
-			return
-		default:
-			log.Fatalf("unknown subcommand %q", os.Args[1])
-		}
+	log.SetFlags(0)
+
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, usage(filepath.Base(os.Args[0])))
+		os.Exit(1)
 	}
 
-	if err := runAPIServer(); err != nil {
-		log.Fatalf("server error: %v", err)
+	switch os.Args[1] {
+	case "serve":
+		serveCmd := flag.NewFlagSet("serve", flag.ExitOnError)
+		dbPath := serveCmd.String("f", "", "path to SQLite database file (defaults to waitlist.db or $DATABASE_PATH)")
+		serveCmd.Parse(os.Args[2:])
+
+		if err := runAPIServer(*dbPath); err != nil {
+			log.Fatalf("server error: %v", err)
+		}
+	case "list":
+		listCmd := flag.NewFlagSet("list", flag.ExitOnError)
+		dbPath := listCmd.String("f", "", "path to SQLite database file (defaults to waitlist.db or $DATABASE_PATH)")
+		listCmd.Parse(os.Args[2:])
+
+		if err := listWaitlistEntries(*dbPath, os.Stdout); err != nil {
+			log.Fatalf("list failed: %v", err)
+		}
+	case "-h", "--help":
+		fmt.Println(usage(filepath.Base(os.Args[0])))
+	default:
+		fmt.Fprintln(os.Stderr, usage(filepath.Base(os.Args[0])))
+		log.Fatalf("unknown subcommand %q", os.Args[1])
 	}
 }
 
-func runAPIServer() error {
-	db, err := setupDatabase()
+func usage(cmd string) string {
+	return fmt.Sprintf(`Usage:
+  %s serve [-f path]
+  %s list [-f path]
+
+Commands:
+  serve   Start the waitlist HTTP API server.
+  list    Print all waitlist entries.`, cmd, cmd)
+}
+
+func runAPIServer(dbPathOverride string) error {
+	dbPath := resolveDatabasePath(dbPathOverride)
+
+	db, err := setupDatabase(dbPath)
 	if err != nil {
 		return fmt.Errorf("database setup failed: %w", err)
 	}
@@ -64,7 +95,7 @@ func runAPIServer() error {
 	mux.HandleFunc("/api/v1/waitlist", srv.waitlistHandler)
 
 	addr := serverAddr()
-	log.Printf("waitlist API listening on %s", addr)
+	log.Printf("waitlist API listening on %s (database %s)", addr, dbPath)
 
 	if err := http.ListenAndServe(addr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("listen and serve: %w", err)
@@ -73,35 +104,63 @@ func runAPIServer() error {
 	return nil
 }
 
-func runDemo() error {
-	db, err := setupDemoDatabase()
+func listWaitlistEntries(dbPathOverride string, out io.Writer) error {
+	dbPath := resolveDatabasePath(dbPathOverride)
+
+	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
+		if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("database file %q not found", dbPath)
+		} else if err != nil {
+			return fmt.Errorf("stat database: %w", err)
+		}
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		return fmt.Errorf("demo database setup failed: %w", err)
+		return fmt.Errorf("open database: %w", err)
 	}
 	defer db.Close()
 
-	srv := &server{db: db}
+	if err := initializeDatabase(db); err != nil {
+		return fmt.Errorf("initialize database: %w", err)
+	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", serveIndex)
-	mux.HandleFunc("/api/v1/waitlist", srv.waitlistHandler)
+	rows, err := db.Query(`SELECT id, email, created_at FROM waitlist ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return fmt.Errorf("query waitlist: %w", err)
+	}
+	defer rows.Close()
 
-	addr := demoAddr()
-	log.Printf("demo server serving index.html on %s", addr)
-	log.Printf("demo submissions are stored in waitlist-demo.db")
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tEmail\tCreated At")
 
-	if err := http.ListenAndServe(addr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("listen and serve: %w", err)
+	count := 0
+	for rows.Next() {
+		var (
+			id      int64
+			email   string
+			created string
+		)
+		if err := rows.Scan(&id, &email, &created); err != nil {
+			return fmt.Errorf("scan row: %w", err)
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\n", id, email, created)
+		count++
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate rows: %w", err)
+	}
+
+	if count == 0 {
+		fmt.Fprintln(tw, "(no entries)\t\t")
+	}
+
+	if err := tw.Flush(); err != nil {
+		return fmt.Errorf("flush output: %w", err)
 	}
 
 	return nil
-}
-
-func serverAddr() string {
-	if port, ok := os.LookupEnv("PORT"); ok && port != "" {
-		return ":" + port
-	}
-	return ":8080"
 }
 
 func (s *server) waitlistHandler(w http.ResponseWriter, r *http.Request) {
@@ -169,30 +228,11 @@ func isUniqueConstraint(err error) bool {
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
-func setupDatabase() (*sql.DB, error) {
-	path := databasePath()
-
+func setupDatabase(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
-
-	if err := initializeDatabase(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-
-	return db, nil
-}
-
-func setupDemoDatabase() (*sql.DB, error) {
-	db, err := sql.Open("sqlite", "waitlist-demo.db")
-	if err != nil {
-		return nil, err
-	}
-
-	// Single connection keeps the in-memory database alive for the life of the process.
-	db.SetMaxOpenConns(1)
 
 	if err := initializeDatabase(db); err != nil {
 		db.Close()
@@ -214,6 +254,13 @@ func initializeDatabase(db *sql.DB) error {
 	return nil
 }
 
+func resolveDatabasePath(override string) string {
+	if override != "" {
+		return override
+	}
+	return databasePath()
+}
+
 func databasePath() string {
 	if path, ok := os.LookupEnv("DATABASE_PATH"); ok && path != "" {
 		return path
@@ -221,14 +268,11 @@ func databasePath() string {
 	return "waitlist.db"
 }
 
-func demoAddr() string {
-	if port, ok := os.LookupEnv("DEMO_PORT"); ok && port != "" {
-		if strings.HasPrefix(port, ":") {
-			return port
-		}
+func serverAddr() string {
+	if port, ok := os.LookupEnv("PORT"); ok && port != "" {
 		return ":" + port
 	}
-	return serverAddr()
+	return ":8080"
 }
 
 func serveIndex(w http.ResponseWriter, r *http.Request) {
