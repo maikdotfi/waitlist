@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Waitlist Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; background: #f7f8fa; color: #222; }
+    main { max-width: 28rem; margin: auto; background: #fff; padding: 2rem; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
+    h1 { margin-top: 0; font-size: 1.75rem; }
+    p { line-height: 1.5; }
+    form { display: grid; gap: 0.75rem; margin-top: 1.5rem; }
+    label { font-weight: 600; }
+    input[type="email"] { padding: 0.75rem; border: 1px solid #c7ccd1; border-radius: 8px; font-size: 1rem; }
+    button { padding: 0.8rem; font-size: 1rem; font-weight: 600; color: #fff; background: #3b82f6; border: none; border-radius: 8px; cursor: pointer; }
+    button:hover { background: #2563eb; }
+    .note { font-size: 0.9rem; color: #555; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Join the Waitlist</h1>
+    <p>Drop your email below and this server will stash it into the SQLite waitlist table. The form posts directly to <code>/api/v1/waitlist</code> using regular browser form encoding—no JavaScript required.</p>
+    <form action="/api/v1/waitlist" method="post">
+      <label for="email">Email address</label>
+      <input id="email" name="email" type="email" placeholder="you@example.com" required>
+      <button type="submit">Sign me up</button>
+      <p class="note">You'll see the server response below; if JavaScript is disabled you'll be redirected to a confirmation page.</p>
+      <p class="note" id="status" role="status" aria-live="polite"></p>
+    </form>
+  </main>
+  <script type="module">
+    const form = document.querySelector('form');
+    const status = document.querySelector('#status');
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+
+      status.textContent = 'Submitting…';
+      status.style.color = '#555';
+
+      try {
+        const response = await fetch(form.action, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: form.email.value.trim() }),
+        });
+
+        const data = await response.json();
+        status.textContent = data.message ?? 'Submission complete.';
+        status.style.color = response.ok ? '#0a7' : '#d33';
+
+        if (response.ok) {
+          form.reset();
+        }
+      } catch (error) {
+        status.textContent = 'Network error, please try again.';
+        status.style.color = '#d33';
+      }
+    });
+  </script>
+</body>
+</html>
