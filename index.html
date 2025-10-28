@@ -15,6 +15,8 @@
     button { padding: 0.8rem; font-size: 1rem; font-weight: 600; color: #fff; background: #3b82f6; border: none; border-radius: 8px; cursor: pointer; }
     button:hover { background: #2563eb; }
     .note { font-size: 0.9rem; color: #555; margin-top: 0.5rem; }
+    .hp-wrapper { position: absolute; left: -100vw; width: 1px; height: 1px; overflow: hidden; }
+    .hp-field { position: absolute; left: -100vw; opacity: 0; pointer-events: none; }
   </style>
 </head>
 <body>
@@ -22,6 +24,10 @@
     <h1>Join the Waitlist</h1>
     <p>Drop your email below and this server will stash it into the SQLite waitlist table. The form posts directly to <code>/api/v1/waitlist</code> using regular browser form encoding—no JavaScript required.</p>
     <form action="/api/v1/waitlist" method="post">
+      <div class="hp-wrapper" aria-hidden="true">
+        <label for="nickname">Your nickname</label>
+        <input id="nickname" class="hp-field" name="nickname" type="text" autocomplete="off" tabindex="-1" placeholder="Nickname">
+      </div>
       <label for="email">Email address</label>
       <input id="email" name="email" type="email" placeholder="you@example.com" required>
       <button type="submit">Sign me up</button>
@@ -43,7 +49,10 @@
         const response = await fetch(form.action, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: form.email.value.trim() }),
+          body: JSON.stringify({
+            email: form.email.value.trim(),
+            nickname: form.nickname?.value.trim() ?? '',
+          }),
         });
 
         const data = await response.json();

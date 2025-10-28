@@ -23,6 +23,7 @@ import (
 // waitlistRequest models the expected JSON payload.
 type waitlistRequest struct {
 	Email string `json:"email"`
+	Trap  string `json:"nickname,omitempty"`
 }
 
 type server struct {
@@ -33,6 +34,13 @@ const schema = `
 CREATE TABLE IF NOT EXISTS waitlist (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS waitlist_honeypot (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL,
+    trap_value TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );`
 
@@ -56,10 +64,25 @@ func main() {
 	case "list":
 		listCmd := flag.NewFlagSet("list", flag.ExitOnError)
 		dbPath := listCmd.String("f", "", "path to SQLite database file (defaults to waitlist.db or $DATABASE_PATH)")
+		honeypotOnly := listCmd.Bool("honeypot", false, "list only honeypot trap submissions")
 		listCmd.Parse(os.Args[2:])
 
-		if err := listWaitlistEntries(*dbPath, os.Stdout); err != nil {
+		if err := listWaitlistEntries(*dbPath, os.Stdout, *honeypotOnly); err != nil {
 			log.Fatalf("list failed: %v", err)
+		}
+	case "demo":
+		demoCmd := flag.NewFlagSet("demo", flag.ExitOnError)
+		dir := demoCmd.String("dir", ".", "directory where the demo SQLite database will be created")
+		demoCmd.Parse(os.Args[2:])
+
+		dbPath, err := createDemoDatabase(*dir)
+		if err != nil {
+			log.Fatalf("demo setup failed: %v", err)
+		}
+		log.Printf("demo database created at %s", dbPath)
+
+		if err := runAPIServer(dbPath); err != nil {
+			log.Fatalf("demo server error: %v", err)
 		}
 	case "-h", "--help":
 		fmt.Println(usage(filepath.Base(os.Args[0])))
@@ -72,11 +95,13 @@ func main() {
 func usage(cmd string) string {
 	return fmt.Sprintf(`Usage:
   %s serve [-f path]
-  %s list [-f path]
+  %s list [-f path] [--honeypot]
+  %s demo [-dir path]
 
 Commands:
   serve   Start the waitlist HTTP API server.
-  list    Print all waitlist entries.`, cmd, cmd)
+  list    Print waitlist entries (use --honeypot for trap submissions).
+  demo    Launch the demo server with a fresh SQLite database.`, cmd, cmd, cmd)
 }
 
 func runAPIServer(dbPathOverride string) error {
@@ -104,7 +129,7 @@ func runAPIServer(dbPathOverride string) error {
 	return nil
 }
 
-func listWaitlistEntries(dbPathOverride string, out io.Writer) error {
+func listWaitlistEntries(dbPathOverride string, out io.Writer, honeypotOnly bool) error {
 	dbPath := resolveDatabasePath(dbPathOverride)
 
 	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
@@ -125,26 +150,50 @@ func listWaitlistEntries(dbPathOverride string, out io.Writer) error {
 		return fmt.Errorf("initialize database: %w", err)
 	}
 
-	rows, err := db.Query(`SELECT id, email, created_at FROM waitlist ORDER BY created_at ASC, id ASC`)
+	var rows *sql.Rows
+	queryLabel := "waitlist"
+	if honeypotOnly {
+		rows, err = db.Query(`SELECT id, email, trap_value, created_at FROM waitlist_honeypot ORDER BY created_at ASC, id ASC`)
+		queryLabel = "honeypot"
+	} else {
+		rows, err = db.Query(`SELECT id, email, created_at FROM waitlist ORDER BY created_at ASC, id ASC`)
+	}
 	if err != nil {
-		return fmt.Errorf("query waitlist: %w", err)
+		return fmt.Errorf("query %s: %w", queryLabel, err)
 	}
 	defer rows.Close()
 
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tEmail\tCreated At")
+	if honeypotOnly {
+		fmt.Fprintln(tw, "ID\tEmail\tTrap Value\tCreated At")
+	} else {
+		fmt.Fprintln(tw, "ID\tEmail\tCreated At")
+	}
 
 	count := 0
 	for rows.Next() {
-		var (
-			id      int64
-			email   string
-			created string
-		)
-		if err := rows.Scan(&id, &email, &created); err != nil {
-			return fmt.Errorf("scan row: %w", err)
+		if honeypotOnly {
+			var (
+				id        int64
+				email     string
+				trapValue string
+				created   string
+			)
+			if err := rows.Scan(&id, &email, &trapValue, &created); err != nil {
+				return fmt.Errorf("scan row: %w", err)
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\n", id, email, trapValue, created)
+		} else {
+			var (
+				id      int64
+				email   string
+				created string
+			)
+			if err := rows.Scan(&id, &email, &created); err != nil {
+				return fmt.Errorf("scan row: %w", err)
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%s\n", id, email, created)
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\n", id, email, created)
 		count++
 	}
 
@@ -153,7 +202,11 @@ func listWaitlistEntries(dbPathOverride string, out io.Writer) error {
 	}
 
 	if count == 0 {
-		fmt.Fprintln(tw, "(no entries)\t\t")
+		if honeypotOnly {
+			fmt.Fprintln(tw, "(no honeypot entries)\t\t\t")
+		} else {
+			fmt.Fprintln(tw, "(no entries)\t\t")
+		}
 	}
 
 	if err := tw.Flush(); err != nil {
@@ -178,6 +231,7 @@ func (s *server) waitlistHandler(w http.ResponseWriter, r *http.Request) {
 	isJSON := contentType == "application/json"
 
 	email := ""
+	trapValue := ""
 	switch {
 	case isJSON:
 		var payload waitlistRequest
@@ -186,15 +240,29 @@ func (s *server) waitlistHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		email = payload.Email
+		trapValue = payload.Trap
 	default:
 		if err := r.ParseForm(); err != nil {
 			writeMessage(w, http.StatusBadRequest, "invalid form data", true)
 			return
 		}
 		email = r.FormValue("email")
+		trapValue = r.FormValue("nickname")
 	}
 
 	email = strings.TrimSpace(email)
+	trapValue = strings.TrimSpace(trapValue)
+
+	if trapValue != "" {
+		if err := s.insertHoneypot(r.Context(), email, trapValue); err != nil {
+			log.Printf("failed to insert honeypot entry: %v", err)
+			writeMessage(w, http.StatusInternalServerError, "internal server error", !isJSON)
+			return
+		}
+
+		writeMessage(w, http.StatusCreated, "email accepted for waitlist", !isJSON)
+		return
+	}
 
 	if email == "" {
 		writeMessage(w, http.StatusBadRequest, "email is required", !isJSON)
@@ -221,6 +289,11 @@ func (s *server) waitlistHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) insertWaitlist(ctx context.Context, email string) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO waitlist(email) VALUES (?)`, email)
+	return err
+}
+
+func (s *server) insertHoneypot(ctx context.Context, email, trapValue string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO waitlist_honeypot(email, trap_value) VALUES (?, ?)`, email, trapValue)
 	return err
 }
 
@@ -266,6 +339,28 @@ func databasePath() string {
 		return path
 	}
 	return "waitlist.db"
+}
+
+func createDemoDatabase(dir string) (string, error) {
+	if dir == "" {
+		dir = "."
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("ensure demo directory: %w", err)
+	}
+
+	f, err := os.CreateTemp(dir, "waitlist-demo-*.db")
+	if err != nil {
+		return "", fmt.Errorf("create demo database file: %w", err)
+	}
+
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("close demo database file: %w", err)
+	}
+
+	return name, nil
 }
 
 func serverAddr() string {
